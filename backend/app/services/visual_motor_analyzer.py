@@ -1,6 +1,11 @@
 import numpy as np
 from typing import Dict, List, Tuple
-from scipy.spatial.distance import euclidean
+
+import math
+
+def euclidean(point1, point2):
+    """Calculate euclidean distance without scipy"""
+    return math.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
 
 class VisualMotorAnalyzer:
     """Analyzes eye tracking and visual-motor coordination metrics"""

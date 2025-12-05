@@ -9,10 +9,12 @@ from datetime import datetime
 from app.models.database import get_db, User, Baseline, SpeechRecording
 from app.models.schemas import SpeechAnalysisRequest, SpeechAnalysisResponse, SpeechFeatures
 from app.services.speech_analyzer import SpeechAnalyzer
+from app.services.whisper_service import WhisperService
 from app.routes.auth import get_current_user
 
 router = APIRouter()
 speech_analyzer = SpeechAnalyzer()
+whisper = WhisperService()
 
 UPLOAD_DIR = "uploads/speech"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -25,7 +27,6 @@ async def analyze_speech(
 ):
     """
     Analyze speech transcript and extract features
-
     If user has a baseline, also calculate drift score
     """
     # Extract features
@@ -71,51 +72,72 @@ async def upload_speech_audio(
     user_id: int = Form(...),
     db: Session = Depends(get_db)
 ):
-    """
-    Upload speech audio file
-
-    Note: This endpoint accepts the audio file but does not perform
-    speech-to-text conversion. In production, you would:
-    1. Save the file
-    2. Send it to a speech-to-text API (Whisper, Google, AssemblyAI)
-    3. Return the transcript
-
-    For now, it just saves the file and returns a placeholder response.
-    """
-    # Generate unique filename
+    # Save file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{user_id}_{timestamp}_{file.filename}"
     file_path = os.path.join(UPLOAD_DIR, filename)
 
-    # Save file
     async with aiofiles.open(file_path, 'wb') as out_file:
         content = await file.read()
         await out_file.write(content)
 
-    # Create database record
-    speech_recording = SpeechRecording(
-        user_id=user_id,
-        file_path=file_path,
-        transcript="",  # Will be filled after speech-to-text
-        duration=0.0,
-        features={}
-    )
+    try:
+        # Transcribe with Whisper
+        result = whisper.transcribe_audio(file_path)
+        
+        # Extract features
+        features = speech_analyzer.analyze_transcript(
+            transcript=result["text"],
+            duration=result["duration"],
+            word_timestamps=result["word_timestamps"]
+        )
 
-    db.add(speech_recording)
-    db.commit()
+        # Get baseline and calculate drift
+        baseline = db.query(Baseline).filter(
+            Baseline.user_id == user_id,
+            Baseline.is_active == True
+        ).first()
 
-    return {
-        "message": "Audio file uploaded successfully",
-        "file_path": file_path,
-        "recording_id": speech_recording.id,
-        "note": "In production, this would trigger speech-to-text processing. For testing, use the /analyze endpoint directly with a transcript."
-    }
+        drift_score = None
+        comparison_text = None
+
+        if baseline:
+            baseline_features = {
+                "wpm": baseline.speech_wpm,
+                "filler_count": baseline.speech_filler_count,
+                "avg_pause": baseline.speech_avg_pause,
+                "speech_rate": baseline.speech_rate
+            }
+            drift_score, comparison_text = speech_analyzer.calculate_drift_score(
+                features, baseline_features
+            )
+
+        # Save recording
+        speech_recording = SpeechRecording(
+            user_id=user_id,
+            file_path=file_path,
+            transcript=result["text"],
+            duration=result["duration"],
+            features=features
+        )
+        db.add(speech_recording)
+        db.commit()
+
+        return {
+            "transcript": result["text"],
+            "duration": result["duration"],
+            "features": features,
+            "drift_score": drift_score,
+            "comparison_text": comparison_text
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/passages")
 async def get_speech_passages():
     """
     Get standardized speech passages for recording
-
     These passages are designed to elicit natural speech patterns
     and provide consistent material for baseline comparison
     """
@@ -145,5 +167,4 @@ async def get_speech_passages():
 
     return {
         "passages": passages,
-        "instructions": "Choose one passage and read it at your natural speaking pace. Try to be as fluent and conversational as possible. Record for 20-60 seconds."
-    }
+        "instructions": "Choose one passage and read it at your natural speaking pace. Try to be as fluent and conversational as possible. Record for 20-60 seconds."}
